@@ -1,0 +1,6 @@
+flask==3.0.3
+requests>=2.32.3
+selenium==4.35.0
+python-dotenv==1.0.1
+flask-limiter==3.8.0
+

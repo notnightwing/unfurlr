@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# App artifacts
+static/screens/
+static/downloads/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
