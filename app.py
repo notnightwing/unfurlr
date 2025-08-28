@@ -8,7 +8,11 @@ from urllib.parse import urljoin
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, redirect, render_template_string, request, url_for, send_file, abort
+import socket
+from urllib.parse import urlparse, quote
+import hashlib
+import mimetypes
 
 from security import validate_target_url
 
@@ -34,8 +38,32 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-FEATURE_SCREENSHOT = os.getenv("FEATURE_SCREENSHOT", "true").lower() == "true"
-FEATURE_DETECTDL = os.getenv("FEATURE_DETECT_DOWNLOADS", "false").lower() == "true"
+# Data directory for artifacts (outside static to avoid direct serving)
+DATA_DIR = os.path.join(app.root_path, "data")
+DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+# Retention for artifacts (days)
+app.config["ARTIFACT_RETENTION_DAYS"] = int(os.getenv("ARTIFACT_RETENTION_DAYS", "7"))
+
+
+@app.after_request
+def add_security_headers(response):
+    csp = (
+        "default-src 'none'; "
+        "img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'none'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'"
+    )
+    response.headers.setdefault("Content-Security-Policy", csp)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
 
 PRIVATE_NETS = [
     ipaddress.ip_network("127.0.0.0/8"),
@@ -55,6 +83,40 @@ def is_ip_private(ip: str) -> bool:
         return any(ip_obj in net for net in PRIVATE_NETS)
     except ValueError:
         return True  # treat unparsable as unsafe
+
+
+def sanitize_user_agent(ua: str) -> str:
+    # Strip control characters and cap length
+    cleaned = "".join(ch for ch in (ua or "") if 32 <= ord(ch) < 127)
+    return cleaned[:512]
+
+
+def resolve_hostname_ips(hostname: str):
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+        ips = []
+        for info in infos:
+            addr = info[4][0]
+            if addr not in ips:
+                ips.append(addr)
+        return ips
+    except Exception:
+        return []
+
+
+def is_url_allowed(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        if p.scheme.lower() not in {"http", "https"}:
+            return False
+        if not p.hostname:
+            return False
+        ips = resolve_hostname_ips(p.hostname)
+        if not ips:
+            return False
+        return not any(is_ip_private(ip) for ip in ips)
+    except Exception:
+        return False
 
 
 # -------- User-Agent presets (2024–2025 realistic) --------
@@ -213,8 +275,6 @@ def mobile_emulation_payload(ua_string: str, ua_key: str):
     }
 
 
-# If you keep resolve_user_agent(), add random rotation support:
-
 RANDOM_POOL = [
     "chrome_win",
     "chrome_mac",
@@ -232,7 +292,7 @@ def resolve_user_agent(ua_key: str, ua_custom: str):
     """
     key = (ua_key or "").strip() or DEFAULT_UA_KEY
     if key == "custom" and ua_custom.strip():
-        return ua_custom.strip(), "Custom"
+        return sanitize_user_agent(ua_custom.strip()), "Custom"
     if key == "random":
         picked = random.choice(RANDOM_POOL)
         return UA_PRESETS[picked], UA_LABELS.get(picked, picked)
@@ -246,56 +306,80 @@ def resolve_user_agent(ua_key: str, ua_custom: str):
 def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
     """
     Returns a list of hop dicts:
-      { 'url': <url>, 'status': <int or None>, 'method': 'HEAD'|'GET'|None }
+      { 'url': <url>, 'status': <int or None>, 'method': 'HEAD'|'GET'|None, 'elapsed_ms': <float|None> }
     First element is the normalized starting URL.
+    Uses a shared requests.Session across hops for connection reuse.
     """
     if not start_url.lower().startswith(("http://", "https://")):
         start_url = "http://" + start_url.strip()
 
-    headers = {"User-Agent": user_agent}
-    chain = [{"url": start_url, "status": None, "method": None}]
+    vtq = quote(f"url:{start_url}", safe='')
+    chain = [{"url": start_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": vtq}]
     current = start_url
 
-    for _ in range(max_hops):
-        # Try HEAD first
-        try:
-            resp = requests.head(
-                current, allow_redirects=False, headers=headers, timeout=timeout
-            )
-            status = resp.status_code
-            method_used = "HEAD"
-        except requests.RequestException:
-            # Fallback to GET if HEAD fails/is blocked
+    # Initial guard
+    if not is_url_allowed(current):
+        return chain
+
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": user_agent})
+
+        for _ in range(max_hops):
+            resp = None
+            status = None
+            method_used = None
+            elapsed_ms = None
+
+            # Try HEAD first
             try:
-                resp = requests.get(
-                    current, allow_redirects=False, headers=headers, timeout=timeout
+                t0 = time.monotonic()
+                resp = session.head(
+                    current, allow_redirects=False, timeout=timeout
                 )
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
                 status = resp.status_code
-                method_used = "GET"
+                method_used = "HEAD"
             except requests.RequestException:
-                chain[-1]["status"] = None
-                chain[-1]["method"] = None
+                # Fallback to GET if HEAD fails/is blocked
+                try:
+                    t0 = time.monotonic()
+                    resp = session.get(
+                        current, allow_redirects=False, timeout=timeout
+                    )
+                    elapsed_ms = (time.monotonic() - t0) * 1000.0
+                    status = resp.status_code
+                    method_used = "GET"
+                except requests.RequestException:
+                    chain[-1]["status"] = None
+                    chain[-1]["method"] = None
+                    chain[-1]["elapsed_ms"] = None
+                    break
+
+            chain[-1]["status"] = status
+            chain[-1]["method"] = method_used
+            chain[-1]["elapsed_ms"] = round(elapsed_ms, 2) if elapsed_ms is not None else None
+
+            if not (300 <= status < 400):
                 break
 
-        chain[-1]["status"] = status
-        chain[-1]["method"] = method_used
+            loc = resp.headers.get("Location") if resp is not None else None
+            if not loc:
+                break
 
-        if not (300 <= status < 400):
-            break
+            next_url = urljoin(current, loc)
 
-        loc = resp.headers.get("Location")
-        if not loc:
-            break
+            # enforce guards per hop
+            if not is_url_allowed(next_url):
+                chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": quote(f"url:{next_url}", safe='')})
+                break
 
-        next_url = urljoin(current, loc)
+            # prevent loops
+            if any(h["url"] == next_url for h in chain):
+                chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None})
+                break
 
-        # prevent loops
-        if any(h["url"] == next_url for h in chain):
-            chain.append({"url": next_url, "status": None, "method": None})
-            break
-
-        chain.append({"url": next_url, "status": None, "method": None})
-        current = next_url
+            chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": quote(f"url:{next_url}", safe='')})
+            current = next_url
 
     return chain
 
@@ -313,6 +397,9 @@ def capture_screenshot(
     If Selenium isn’t available or fails, returns None.
     """
     if not SELENIUM_AVAILABLE:
+        return None
+
+    if not is_url_allowed(final_url):
         return None
 
     out_path = os.path.join(app.root_path, outfile_rel)
@@ -361,8 +448,11 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
     if not SELENIUM_AVAILABLE:
         return [], "Selenium/ChromeDriver not available; skipped download detection."
 
-    dl_rel_dir = f"static/downloads/{session_tag}"
-    dl_abs_dir = os.path.join(app.root_path, dl_rel_dir)
+    if not is_url_allowed(final_url):
+        return [], "Final URL blocked by policy."
+
+    dl_rel_dir = f"downloads/{session_tag}"
+    dl_abs_dir = os.path.join(DOWNLOADS_DIR, session_tag)
     os.makedirs(dl_abs_dir, exist_ok=True)
 
     try:
@@ -407,9 +497,30 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
 
             final = set(os.listdir(dl_abs_dir))
             new_items = [n for n in (final - before) if not n.endswith(".crdownload")]
-            webpaths = [f"/{dl_rel_dir}/{name}" for name in new_items]
-            if new_items:
-                return webpaths, None
+            items = []
+            for name in new_items:
+                abs_path = os.path.join(dl_abs_dir, name)
+                try:
+                    with open(abs_path, "rb") as f:
+                        sha256 = hashlib.sha256(f.read()).hexdigest()
+                except Exception:
+                    sha256 = None
+                mime, _ = mimetypes.guess_type(name)
+                try:
+                    size = os.path.getsize(abs_path)
+                except Exception:
+                    size = None
+                items.append(
+                    {
+                        "url": url_for("serve_download", session=session_tag, filename=name),
+                        "name": name,
+                        "sha256": sha256,
+                        "mime": mime,
+                        "size": size,
+                    }
+                )
+            if items:
+                return items, None
             return [], "No downloads detected in the wait window."
         finally:
             driver.quit()
@@ -501,12 +612,18 @@ RESULTS_HTML = """
 <ol>
 {% for hop in chain %}
   <li>
-    <a href="{{ hop.url }}" target="_blank" rel="noopener">{{ hop.url }}</a>
+    {% set scheme = (hop.url.split('://', 1)[0] | lower) if '://' in hop.url else '' %}
+    {% if scheme in ['http', 'https'] %}
+      <a href="{{ hop.url }}" target="_blank" rel="noopener">{{ hop.url }}</a>
+    {% else %}
+      <code>{{ hop.url }}</code>
+    {% endif %}
     {% if hop.status is not none %} — <strong>{{ hop.status }}</strong>{% endif %}
     {% if hop.method %} ({{ hop.method }}){% endif %}
+    {% if hop.elapsed_ms is not none %} — {{ hop.elapsed_ms }} ms{% endif %}
     &nbsp;|&nbsp;
     <a
-      href="https://www.virustotal.com/gui/search/{{ hop.url | urlencode }}"
+      href="https://www.virustotal.com/gui/search/{{ hop.vt_query }}"
       target="_blank"
       rel="noopener"
     >
@@ -533,11 +650,16 @@ RESULTS_HTML = """
 
 {% if tried_detectdl %}
   <h2>Auto-download Detection</h2>
-  {% if download_paths and download_paths|length > 0 %}
+  {% if download_items and download_items|length > 0 %}
     <p><strong>Downloads detected:</strong></p>
     <ul>
-      {% for p in download_paths %}
-        <li><a href="{{ p }}" target="_blank" rel="noopener">{{ p.rsplit('/', 1)[-1] }}</a></li>
+      {% for d in download_items %}
+        <li>
+          <a href="{{ d.url }}" rel="noopener">{{ d.name }}</a>
+          {% if d.size %} — {{ d.size }} bytes{% endif %}
+          {% if d.mime %} — {{ d.mime }}{% endif %}
+          {% if d.sha256 %}<br><small>SHA-256: <code>{{ d.sha256 }}</code></small>{% endif %}
+        </li>
       {% endfor %}
     </ul>
   {% else %}
@@ -587,7 +709,7 @@ def check_url():
     screenshot_note = None
 
     tried_detectdl = False
-    download_paths = []
+    download_items = []
     download_note = None
 
     # Screenshot
@@ -607,7 +729,7 @@ def check_url():
         tried_detectdl = True
         final_url = chain[-1]["url"]
         session_tag = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
-        download_paths, download_note = detect_auto_downloads(
+        download_items, download_note = detect_auto_downloads(
             final_url, user_agent=ua_string, ua_key=ua_key, session_tag=session_tag
         )
 
@@ -623,12 +745,58 @@ def check_url():
         tried_screenshot=tried_screenshot,
         screenshot_note=screenshot_note,  # now always defined
         tried_detectdl=tried_detectdl,
-        download_paths=download_paths,
+        download_items=download_items,
         download_note=download_note,  # now always defined
     )
 
 
+@app.route("/downloads/<session>/<path:filename>")
+def serve_download(session, filename):
+    # Construct absolute path and prevent traversal
+    base = os.path.realpath(DOWNLOADS_DIR)
+    abs_path = os.path.realpath(os.path.join(base, session, filename))
+    if not abs_path.startswith(os.path.join(base, "")):
+        abort(404)
+    if not os.path.isfile(abs_path):
+        abort(404)
+    mime, _ = mimetypes.guess_type(filename)
+    return send_file(abs_path, as_attachment=True, download_name=os.path.basename(filename), mimetype=mime or "application/octet-stream")
+
+
+@app.before_first_request
+def scheduled_cleanup():
+    try:
+        purge_old_artifacts(app.config.get("ARTIFACT_RETENTION_DAYS", 7))
+    except Exception:
+        pass
+
+
+def purge_old_artifacts(max_age_days: int = 7):
+    now = time.time()
+    cutoff = now - max_age_days * 86400
+    # downloads
+    for root, dirs, files in os.walk(DOWNLOADS_DIR, topdown=False):
+        for name in files:
+            p = os.path.join(root, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+        for d in dirs:
+            full = os.path.join(root, d)
+            try:
+                if not os.listdir(full):
+                    os.rmdir(full)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     os.makedirs(app.static_folder, exist_ok=True)
+    try:
+        purge_old_artifacts(app.config.get("ARTIFACT_RETENTION_DAYS", 7))
+    except Exception:
+        pass
     # Only enable Flask debug when FLASK_ENV=development
     app.run(debug=os.getenv("FLASK_ENV") == "development")
