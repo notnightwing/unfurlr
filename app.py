@@ -4,6 +4,7 @@ import os
 import random
 import time
 from datetime import datetime
+import secrets
 from urllib.parse import urljoin
 
 import requests
@@ -31,9 +32,23 @@ load_dotenv()
 app = Flask(__name__)
 
 # Basic config
+_env = os.getenv("FLASK_ENV")
+_is_dev = _env == "development"
+_secret_from_env = os.getenv("SECRET_KEY", "").strip()
+if _is_dev:
+    # In development, generate an ephemeral key if not provided
+    secret_key_value = _secret_from_env or secrets.token_urlsafe(32)
+else:
+    # In non-development, require a strong key
+    if not _secret_from_env or _secret_from_env in {"dev-not-secret", "changeme", "secret"}:
+        raise RuntimeError(
+            "SECRET_KEY must be set to a strong value in production environments."
+        )
+    secret_key_value = _secret_from_env
+
 app.config.update(
-    SECRET_KEY=os.getenv("SECRET_KEY", "dev-not-secret"),
-    SESSION_COOKIE_SECURE=False if os.getenv("FLASK_ENV") == "development" else True,
+    SECRET_KEY=secret_key_value,
+    SESSION_COOKIE_SECURE=False if _is_dev else True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
