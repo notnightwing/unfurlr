@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
+import ipaddress
 import os
+import random
 import time
-import requests
-import ipaddress, socket
-from urllib.parse import urljoin, quote, urlparse
 from datetime import datetime
-from flask import Flask, request, render_template_string, redirect, url_for
+from urllib.parse import urljoin
+
+import requests
 from dotenv import load_dotenv
+from flask import Flask, redirect, render_template_string, request, url_for
+
+from security import validate_target_url
 
 # Optional: Selenium
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+
     SELENIUM_AVAILABLE = True
 except Exception:
     SELENIUM_AVAILABLE = False
@@ -24,13 +29,13 @@ app = Flask(__name__)
 # Basic config
 app.config.update(
     SECRET_KEY=os.getenv("SECRET_KEY", "dev-not-secret"),
-    SESSION_COOKIE_SECURE=False if os.getenv("FLASK_ENV")=="development" else True,
+    SESSION_COOKIE_SECURE=False if os.getenv("FLASK_ENV") == "development" else True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-FEATURE_SCREENSHOT = os.getenv("FEATURE_SCREENSHOT","true").lower()=="true"
-FEATURE_DETECTDL   = os.getenv("FEATURE_DETECT_DOWNLOADS","false").lower()=="true"
+FEATURE_SCREENSHOT = os.getenv("FEATURE_SCREENSHOT", "true").lower() == "true"
+FEATURE_DETECTDL = os.getenv("FEATURE_DETECT_DOWNLOADS", "false").lower() == "true"
 
 PRIVATE_NETS = [
     ipaddress.ip_network("127.0.0.0/8"),
@@ -43,32 +48,13 @@ PRIVATE_NETS = [
     ipaddress.ip_network("fe80::/10"),
 ]
 
+
 def is_ip_private(ip: str) -> bool:
     try:
         ip_obj = ipaddress.ip_address(ip)
         return any(ip_obj in net for net in PRIVATE_NETS)
     except ValueError:
         return True  # treat unparsable as unsafe
-
-def validate_target_url(raw: str) -> tuple[bool, str]:
-    if not raw.lower().startswith(("http://","https://")):
-        raw = "http://" + raw.strip()
-    u = urlparse(raw)
-
-    if u.scheme not in ("http","https"):
-        return False, "Unsupported URL scheme."
-    if not u.hostname:
-        return False, "Missing hostname."
-
-    try:
-        infos = socket.getaddrinfo(u.hostname, None)
-        ips = {i[4][0] for i in infos}
-        if any(is_ip_private(ip) for ip in ips):
-            return False, "Target resolves to a private or link-local address."
-    except socket.gaierror:
-        return False, "Hostname could not be resolved."
-
-    return True, raw
 
 
 # -------- User-Agent presets (2024–2025 realistic) --------
@@ -98,7 +84,6 @@ UA_PRESETS = {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
     ),
-
     # Mobile browsers
     "safari_ios": (
         # iPhone iOS 18 Safari
@@ -115,7 +100,6 @@ UA_PRESETS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/128.0.0.0 Mobile Safari/537.36 SamsungBrowser/26.0"
     ),
-
     # Link preview / in-app browsers (very handy for phishing triage)
     "facebook_inapp_ios": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
@@ -145,7 +129,6 @@ UA_PRESETS = {
         "Chrome/128.0.0.0 Safari/537.36 OutlookDesktop"
     ),
     "slackbot": "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
-
     # Crawlers / bots
     "googlebot_desktop": (
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
@@ -153,18 +136,15 @@ UA_PRESETS = {
     "googlebot_smartphone": (
         # Current pattern: Chrome-like UA + Googlebot token
         "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        "Chrome/128.0.0.0 Mobile Safari/537.36 "
+        "(compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
     ),
     "bingbot": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-
     # Legacy (still occasionally useful)
-    "ie11_win7": (
-        "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko"
-    ),
-
+    "ie11_win7": ("Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko"),
     # Special
-    "random": "__RANDOM__",   # handled in resolve_user_agent()
-    "custom": "",             # use text box
+    "random": "__RANDOM__",  # handled in resolve_user_agent()
+    "custom": "",  # use text box
 }
 
 UA_LABELS = {
@@ -173,24 +153,19 @@ UA_LABELS = {
     "edge_win": "Windows 10/11 : Edge 128",
     "firefox_win": "Windows 10/11 : Firefox 130",
     "safari_mac": "macOS : Safari 18",
-
     "safari_ios": "iPhone (iOS 18) : Safari",
     "chrome_android": "Android 14 : Chrome",
     "samsung_internet": "Android 14 : Samsung Internet 26",
-
     "facebook_inapp_ios": "Facebook In-App (iOS)",
     "instagram_inapp_ios": "Instagram In-App (iOS)",
     "tiktok_inapp_android": "TikTok In-App (Android)",
     "twitter_iphone": "Twitter/X In-App (iPhone)",
     "outlook_win_preview": "Outlook Desktop Link Preview",
     "slackbot": "Slack Link Expander",
-
     "googlebot_desktop": "Googlebot (Desktop)",
     "googlebot_smartphone": "Googlebot (Smartphone)",
     "bingbot": "Bingbot",
-
     "ie11_win7": "Windows 7 : IE 11",
-
     "random": "Random (rotate)",
     "custom": "Custom…",
 }
@@ -199,14 +174,20 @@ DEFAULT_UA_KEY = "chrome_win"
 
 # Which UA keys should use a mobile viewport?
 MOBILE_UA_KEYS = {
-    "safari_ios", "chrome_android", "samsung_internet",
-    "facebook_inapp_ios", "instagram_inapp_ios",
-    "tiktok_inapp_android", "twitter_iphone",
+    "safari_ios",
+    "chrome_android",
+    "samsung_internet",
+    "facebook_inapp_ios",
+    "instagram_inapp_ios",
+    "tiktok_inapp_android",
+    "twitter_iphone",
     "googlebot_smartphone",
 }
 
+
 def is_mobile_ua_key(ua_key: str) -> bool:
     return (ua_key or "").strip() in MOBILE_UA_KEYS
+
 
 def mobile_emulation_payload(ua_string: str, ua_key: str):
     """
@@ -214,7 +195,12 @@ def mobile_emulation_payload(ua_string: str, ua_key: str):
     Pick sizes that look realistic for the chosen family.
     """
     # Two sensible defaults
-    if ua_key in {"safari_ios", "facebook_inapp_ios", "instagram_inapp_ios", "twitter_iphone"}:
+    if ua_key in {
+        "safari_ios",
+        "facebook_inapp_ios",
+        "instagram_inapp_ios",
+        "twitter_iphone",
+    }:
         # iPhone 15 Pro-ish
         return {
             "deviceMetrics": {"width": 393, "height": 852, "pixelRatio": 3},  # CSS px
@@ -228,11 +214,17 @@ def mobile_emulation_payload(ua_string: str, ua_key: str):
 
 
 # If you keep resolve_user_agent(), add random rotation support:
-import random
+
 RANDOM_POOL = [
-    "chrome_win", "chrome_mac", "edge_win", "firefox_win",
-    "safari_ios", "chrome_android", "samsung_internet"
+    "chrome_win",
+    "chrome_mac",
+    "edge_win",
+    "firefox_win",
+    "safari_ios",
+    "chrome_android",
+    "samsung_internet",
 ]
+
 
 def resolve_user_agent(ua_key: str, ua_custom: str):
     """
@@ -248,6 +240,7 @@ def resolve_user_agent(ua_key: str, ua_custom: str):
         return UA_PRESETS[key], UA_LABELS.get(key, key)
     # fallback
     return UA_PRESETS[DEFAULT_UA_KEY], UA_LABELS.get(DEFAULT_UA_KEY, DEFAULT_UA_KEY)
+
 
 # ---------- Core: follow redirects safely ----------
 def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
@@ -266,13 +259,17 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
     for _ in range(max_hops):
         # Try HEAD first
         try:
-            resp = requests.head(current, allow_redirects=False, headers=headers, timeout=timeout)
+            resp = requests.head(
+                current, allow_redirects=False, headers=headers, timeout=timeout
+            )
             status = resp.status_code
             method_used = "HEAD"
         except requests.RequestException:
             # Fallback to GET if HEAD fails/is blocked
             try:
-                resp = requests.get(current, allow_redirects=False, headers=headers, timeout=timeout)
+                resp = requests.get(
+                    current, allow_redirects=False, headers=headers, timeout=timeout
+                )
                 status = resp.status_code
                 method_used = "GET"
             except requests.RequestException:
@@ -302,9 +299,13 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
 
     return chain
 
+
 # ---------- Optional: capture screenshot of final URL ----------
 
-def capture_screenshot(final_url, user_agent, ua_key, outfile_rel="static/screens/final_screenshot.png"):
+
+def capture_screenshot(
+    final_url, user_agent, ua_key, outfile_rel="static/screens/final_screenshot.png"
+):
     """
     Captures a screenshot of final_url into ./static/screens/ and
     returns a web path like '/static/screens/<file>.png'.
@@ -329,8 +330,7 @@ def capture_screenshot(final_url, user_agent, ua_key, outfile_rel="static/screen
         if is_mobile_ua_key(ua_key):
             # Use Chrome's mobile emulation so layout + DPR look authentic
             options.add_experimental_option(
-                "mobileEmulation",
-                mobile_emulation_payload(user_agent, ua_key)
+                "mobileEmulation", mobile_emulation_payload(user_agent, ua_key)
             )
         else:
             # Desktop: just set UA header
@@ -351,6 +351,7 @@ def capture_screenshot(final_url, user_agent, ua_key, outfile_rel="static/screen
 
 # ---------- Optional: detect auto-downloads on final URL ----------
 
+
 def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
     """
     Visits final_url in headless Chrome with a dedicated download dir.
@@ -369,12 +370,13 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1280,800")  # desktop default; ignored by mobile emu
+        options.add_argument(
+            "--window-size=1280,800"
+        )  # desktop default; ignored by mobile emu
 
         if is_mobile_ua_key(ua_key):
             options.add_experimental_option(
-                "mobileEmulation",
-                mobile_emulation_payload(user_agent, ua_key)
+                "mobileEmulation", mobile_emulation_payload(user_agent, ua_key)
             )
         else:
             options.add_argument(f"--user-agent={user_agent}")
@@ -413,6 +415,7 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
             driver.quit()
     except Exception as e:
         return [], f"Download detection failed: {e}"
+
 
 # ---------- Templates ----------
 FORM_HTML = """
@@ -462,7 +465,7 @@ FORM_HTML = """
 
       <option value="random">Random (rotate)</option>
       <option value="custom">Custom…</option>
-    </select>  
+    </select>
       <div style="margin-top:6px;">
         <input type="text" name="ua_custom" placeholder="Custom User-Agent"
                style="width: min(600px, 90%)"
@@ -472,8 +475,15 @@ FORM_HTML = """
   </details>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" name="screenshot" value="1"> Take screenshot of final page</label><br>
-    <label><input type="checkbox" name="detectdl" value="1"> Detect auto-downloads on final page</label>
+    <label>
+     <input type="checkbox" name="screenshot" value="1">
+     Take screenshot of final page
+    </label>
+    <br>
+    <label>
+     <input type="checkbox" name="detectdl" value="1">
+     Detect auto-downloads on final page
+    </label>
   </div>
   <br>
   <input type="submit" value="Check URL">
@@ -495,7 +505,11 @@ RESULTS_HTML = """
     {% if hop.status is not none %} — <strong>{{ hop.status }}</strong>{% endif %}
     {% if hop.method %} ({{ hop.method }}){% endif %}
     &nbsp;|&nbsp;
-    <a href="https://www.virustotal.com/gui/search/{{ hop.url | urlencode }}" target="_blank" rel="noopener">
+    <a
+      href="https://www.virustotal.com/gui/search/{{ hop.url | urlencode }}"
+      target="_blank"
+      rel="noopener"
+    >
       Check on VirusTotal
     </a>
   </li>
@@ -504,8 +518,15 @@ RESULTS_HTML = """
 
 {% if screenshot_path %}
   <h2>Final Page Screenshot</h2>
-  <p style="color:#666;">(If the image is blank, the site may block headless browsers or require interaction.)</p>
-  <img src="{{ screenshot_path }}" alt="Final page screenshot" style="max-width: 100%; height: auto; border:1px solid #ddd;">
+  <p
+   style="color:#666;">
+   (If the image is blank, the site may block headless browsers or require interaction.)
+  </p>
+  <img
+   src="{{ screenshot_path }}"
+   alt="Final page screenshot"
+   style="max-width: 100%; height: auto; border:1px solid #ddd;"
+  >
 {% elif tried_screenshot %}
   <p><em>{{ screenshot_note or "Screenshot was requested but not available." }}</em></p>
 {% endif %}
@@ -527,45 +548,49 @@ RESULTS_HTML = """
 <p><a href="{{ url_for('index') }}">Check another URL</a></p>
 """
 
+
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(FORM_HTML)
 
+
 @app.route("/check-url", methods=["GET"])
 def check_url():
     submitted_url = request.args.get("url", "").strip()
-    if not submitted_url:
-        return redirect(url_for("index"))
-
     ok, normalized = validate_target_url(submitted_url)
     if not ok:
         return render_template_string(
-            "<p><strong>Invalid URL:</strong> {{ msg }}</p><p><a href='{{ url_for('index') }}'>Back</a></p>",
-            msg=normalized
+            "<p><strong>Invalid URL:</strong> {{ msg }}</p>"
+            "<p><a href='{{ url_for('index') }}'>Back</a></p>",
+            msg=normalized,
         )
     submitted_url = normalized
 
-    ua_string, ua_label = resolve_user_agent(ua_key, ua_custom)
+    # ✅ define these first
+    ua_key = request.args.get("ua", DEFAULT_UA_KEY)
+    ua_custom = request.args.get("ua_custom", "")
+    want_shot = request.args.get("screenshot") == "1"
+    want_detect = request.args.get("detectdl") == "1"
 
+    if not submitted_url:
+        return redirect(url_for("index"))
+
+    # (optional) URL validation here…
+
+    ua_string, ua_label = resolve_user_agent(ua_key, ua_custom)
     chain = get_redirect_chain(submitted_url, user_agent=ua_string)
 
-    # Make urlencode filter available (safe to move to module scope if you like)
-    def urlencode_filter(u):
-        return quote(u, safe="")
-    app.jinja_env.filters["urlencode"] = urlencode_filter
+    # Always initialize optionals (avoid UnboundLocalError)
+    screenshot_path = None
+    tried_screenshot = False
+    screenshot_note = None
 
-    # -------- Initialize all optional outputs up front --------
-    screenshot_path   = None
-    tried_screenshot  = False
-    screenshot_note   = None
+    tried_detectdl = False
+    download_paths = []
+    download_note = None
 
-    tried_detectdl    = False
-    download_paths    = []
-    download_note     = None
-    # ----------------------------------------------------------
-
-    # Optional screenshot
+    # Screenshot
     if want_shot and chain:
         tried_screenshot = True
         final_url = chain[-1]["url"]
@@ -573,9 +598,11 @@ def check_url():
             final_url, user_agent=ua_string, ua_key=ua_key
         )
         if not screenshot_path:
-            screenshot_note = "Selenium/ChromeDriver not available or the screenshot failed."
+            screenshot_note = (
+                "Selenium/ChromeDriver not available or the screenshot failed."
+            )
 
-    # Optional auto-download detection
+    # Auto-download detection
     if want_detect and chain:
         tried_detectdl = True
         final_url = chain[-1]["url"]
@@ -583,6 +610,8 @@ def check_url():
         download_paths, download_note = detect_auto_downloads(
             final_url, user_agent=ua_string, ua_key=ua_key, session_tag=session_tag
         )
+
+    # render_template_string(... pass all vars ...)
 
     return render_template_string(
         RESULTS_HTML,
@@ -592,16 +621,14 @@ def check_url():
         chain=chain,
         screenshot_path=screenshot_path,
         tried_screenshot=tried_screenshot,
-        screenshot_note=screenshot_note,     # now always defined
+        screenshot_note=screenshot_note,  # now always defined
         tried_detectdl=tried_detectdl,
         download_paths=download_paths,
-        download_note=download_note,         # now always defined
+        download_note=download_note,  # now always defined
     )
 
 
 if __name__ == "__main__":
-    # Ensure /static exists for screenshots/downloads
     os.makedirs(app.static_folder, exist_ok=True)
-    app.run(debug=True)
-
-
+    # Only enable Flask debug when FLASK_ENV=development
+    app.run(debug=os.getenv("FLASK_ENV") == "development")
