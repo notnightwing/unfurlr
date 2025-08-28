@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from flask import Flask, redirect, render_template_string, request, url_for, send_file, abort
 import socket
 from urllib.parse import urlparse, quote
+import re
 import hashlib
 import mimetypes
 
@@ -348,8 +349,14 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
             # Try HEAD first
             try:
                 t0 = time.monotonic()
+                # Set Referer to previous hop when available
+                head_headers = {}
+                if len(chain) > 0:
+                    ref = chain[-1]["url"]
+                    if ref != current:
+                        head_headers["Referer"] = ref
                 resp = session.head(
-                    current, allow_redirects=False, timeout=timeout
+                    current, allow_redirects=False, timeout=timeout, headers=head_headers or None
                 )
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
                 status = resp.status_code
@@ -358,8 +365,13 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
                 # Fallback to GET if HEAD fails/is blocked
                 try:
                     t0 = time.monotonic()
+                    get_headers = {}
+                    if len(chain) > 0:
+                        ref = chain[-1]["url"]
+                        if ref != current:
+                            get_headers["Referer"] = ref
                     resp = session.get(
-                        current, allow_redirects=False, timeout=timeout
+                        current, allow_redirects=False, timeout=timeout, headers=get_headers or None
                     )
                     elapsed_ms = (time.monotonic() - t0) * 1000.0
                     status = resp.status_code
@@ -375,13 +387,43 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
             chain[-1]["elapsed_ms"] = round(elapsed_ms, 2) if elapsed_ms is not None else None
 
             if not (300 <= status < 400):
-                break
+                # Not an HTTP redirect. Look for HTML meta refresh if we have body.
+                next_url = None
+                try:
+                    # If we only performed HEAD, do a lightweight GET to scan for meta refresh.
+                    if method_used == "HEAD":
+                        t0 = time.monotonic()
+                        scan_headers = {"Referer": chain[-1]["url"]} if len(chain) > 0 else None
+                        scan_resp = session.get(current, allow_redirects=False, timeout=min(timeout, 5), headers=scan_headers)
+                        elapsed_ms = (time.monotonic() - t0) * 1000.0
+                        status = scan_resp.status_code
+                        method_used = "GET"
+                        chain[-1]["status"] = status
+                        chain[-1]["method"] = method_used
+                        chain[-1]["elapsed_ms"] = round(elapsed_ms, 2)
+                        resp = scan_resp
+                    # Read a limited amount
+                    if resp is not None and resp.headers.get("Content-Type", "").lower().startswith("text"):
+                        body_bytes = resp.content[:65536]
+                        try:
+                            text = body_bytes.decode(resp.encoding or "utf-8", errors="ignore")
+                        except Exception:
+                            text = body_bytes.decode("utf-8", errors="ignore")
+                        # Regex for meta refresh
+                        m = re.search(r"<meta[^>]*http-equiv=[\"']?refresh[\"']?[^>]*content=[\"']?\s*([\d.]+)\s*;\s*url=([^\"'/>\s]+)", text, flags=re.IGNORECASE)
+                        if m:
+                            loc = m.group(2).strip()
+                            next_url = urljoin(current, loc)
+                except requests.RequestException:
+                    pass
 
-            loc = resp.headers.get("Location") if resp is not None else None
-            if not loc:
-                break
-
-            next_url = urljoin(current, loc)
+                if not next_url:
+                    break
+            else:
+                loc = resp.headers.get("Location") if resp is not None else None
+                if not loc:
+                    break
+                next_url = urljoin(current, loc)
 
             # enforce guards per hop
             if not is_url_allowed(next_url):
