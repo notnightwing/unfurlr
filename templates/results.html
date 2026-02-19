@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Unfurlr — Results{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h1>Redirect Chain Results</h1>
+  <p class="submitted-url">Target: <code>{{ submitted_url }}</code></p>
+  <p class="ua-info">
+    <strong>User-Agent:</strong> <code>{{ ua_label }}</code><br>
+    <small>{{ ua_string }}</small>
+  </p>
+
+  <ol class="chain">
+    {% for hop in chain %}
+    <li class="hop">
+      <div class="hop-url">
+        {% set scheme = (hop.url.split('://', 1)[0] | lower) if '://' in hop.url else '' %}
+        {% if scheme in ['http', 'https'] %}
+          <a href="{{ hop.url }}" target="_blank" rel="noopener">{{ hop.url }}</a>
+        {% else %}
+          <code>{{ hop.url }}</code>
+        {% endif %}
+      </div>
+
+      <div class="hop-meta">
+        {% if hop.status is not none %}
+          <span class="badge badge-status">{{ hop.status }}</span>
+        {% endif %}
+        {% if hop.method %}
+          <span class="badge badge-method">{{ hop.method }}</span>
+        {% endif %}
+        {% if hop.elapsed_ms is not none %}
+          <span class="badge badge-timing">{{ hop.elapsed_ms }} ms</span>
+        {% endif %}
+      </div>
+
+      {# VT inline badge #}
+      {% if hop.vt %}
+        {% set vt = hop.vt %}
+        {% if vt.malicious > 0 %}
+          <span class="badge vt-red" title="VirusTotal">VT: {{ vt.malicious }} malicious</span>
+        {% elif vt.suspicious > 0 %}
+          <span class="badge vt-amber" title="VirusTotal">VT: {{ vt.suspicious }} suspicious</span>
+        {% else %}
+          <span class="badge vt-green" title="VirusTotal">VT: clean</span>
+        {% endif %}
+        {% if vt.threat_label %}
+          <span class="badge vt-label">{{ vt.threat_label }}</span>
+        {% endif %}
+      {% endif %}
+
+      <div class="hop-links">
+        <a href="https://www.virustotal.com/gui/search/{{ hop.vt_query }}"
+           target="_blank" rel="noopener">VirusTotal</a>
+        <a href="https://www.mywot.com/scorecard/{{ hop.url | domain }}"
+           target="_blank" rel="noopener">WOT Scorecard</a>
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+</div>
+
+{% if screenshot_path %}
+<div class="card">
+  <h2>Final Page Screenshot</h2>
+  <p class="muted">If the image is blank, the site may block headless browsers or require interaction.</p>
+  <img src="{{ screenshot_path }}" alt="Final page screenshot" class="screenshot">
+</div>
+{% elif tried_screenshot %}
+<div class="card">
+  <p><em>{{ screenshot_note or "Screenshot was requested but not available." }}</em></p>
+</div>
+{% endif %}
+
+{% if tried_detectdl %}
+<div class="card">
+  <h2>Auto-download Detection</h2>
+  {% if download_items and download_items|length > 0 %}
+    <p><strong>Downloads detected:</strong></p>
+    <ul class="download-list">
+      {% for d in download_items %}
+      <li>
+        <a href="{{ d.url }}" rel="noopener">{{ d.name }}</a>
+        {% if d.size %} &mdash; {{ d.size }} bytes{% endif %}
+        {% if d.mime %} &mdash; {{ d.mime }}{% endif %}
+        {% if d.sha256 %}<br><small>SHA-256: <code>{{ d.sha256 }}</code></small>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p><em>{{ download_note or "No downloads detected." }}</em></p>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <a href="{{ url_for('index') }}" class="btn">Analyze another URL</a>
+</div>
+{% endblock %}

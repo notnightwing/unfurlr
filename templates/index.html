@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Unfurlr — Check URL{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h1>Check a URL</h1>
+  <form action="{{ url_for('check_url') }}" method="get">
+    <input type="text" name="url" placeholder="Enter URL to analyze"
+           class="url-input"
+           required autocorrect="off" autocapitalize="none" spellcheck="false">
+
+    <details class="advanced">
+      <summary>Advanced options</summary>
+      <div class="advanced-body">
+        <label for="ua">User-Agent:</label>
+        <select name="ua" id="ua">
+          <option value="chrome_win" selected>Windows 10/11 : Chrome 128</option>
+          <option value="chrome_mac">macOS : Chrome 128</option>
+          <option value="edge_win">Windows 10/11 : Edge 128</option>
+          <option value="firefox_win">Windows 10/11 : Firefox 130</option>
+          <option value="safari_mac">macOS : Safari 18</option>
+
+          <optgroup label="Mobile">
+            <option value="safari_ios">iPhone (iOS 18) : Safari</option>
+            <option value="chrome_android">Android 14 : Chrome</option>
+            <option value="samsung_internet">Android 14 : Samsung Internet</option>
+          </optgroup>
+
+          <optgroup label="In-App / Link Preview">
+            <option value="facebook_inapp_ios">Facebook In-App (iOS)</option>
+            <option value="instagram_inapp_ios">Instagram In-App (iOS)</option>
+            <option value="tiktok_inapp_android">TikTok In-App (Android)</option>
+            <option value="twitter_iphone">Twitter/X In-App (iPhone)</option>
+            <option value="outlook_win_preview">Outlook Desktop Link Preview</option>
+            <option value="slackbot">Slack Link Expander</option>
+          </optgroup>
+
+          <optgroup label="Crawlers">
+            <option value="googlebot_desktop">Googlebot (Desktop)</option>
+            <option value="googlebot_smartphone">Googlebot (Smartphone)</option>
+            <option value="bingbot">Bingbot</option>
+          </optgroup>
+
+          <optgroup label="Legacy">
+            <option value="ie11_win7">Windows 7 : Internet Explorer 11</option>
+          </optgroup>
+
+          <option value="random">Random (rotate)</option>
+          <option value="custom">Custom&hellip;</option>
+        </select>
+
+        <input type="text" name="ua_custom" placeholder="Custom User-Agent"
+               class="url-input"
+               autocorrect="off" autocapitalize="none" spellcheck="false">
+      </div>
+    </details>
+
+    <div class="options-row">
+      <label><input type="checkbox" name="screenshot" value="1"> Take screenshot of final page</label>
+      <label><input type="checkbox" name="detectdl" value="1"> Detect auto-downloads on final page</label>
+    </div>
+
+    <button type="submit" class="btn">Analyze URL</button>
+  </form>
+</div>
+{% endblock %}

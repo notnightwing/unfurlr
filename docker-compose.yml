@@ -1,0 +1,18 @@
+services:
+  unfurlr:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - unfurlr-data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    restart: unless-stopped
+
+volumes:
+  unfurlr-data:

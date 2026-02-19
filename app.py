@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, redirect, render_template_string, request, url_for, send_file, abort
+from flask import Flask, redirect, render_template, request, url_for, send_file, abort
 import socket
 from urllib.parse import urlparse, quote
 import re
@@ -17,6 +17,7 @@ import hashlib
 import mimetypes
 
 from security import validate_target_url
+from virustotal import enrich_chain
 
 # Optional: Selenium
 try:
@@ -68,7 +69,7 @@ def add_security_headers(response):
     csp = (
         "default-src 'none'; "
         "img-src 'self' data: blob:; "
-        "style-src 'self' 'unsafe-inline'; "
+        "style-src 'self'; "
         "script-src 'none'; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
@@ -585,153 +586,20 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
         return [], f"Download detection failed: {e}"
 
 
-# ---------- Templates ----------
-FORM_HTML = """
-<!doctype html>
-<title>Redirect Checker</title>
-<h1>Redirect Checker</h1>
-<form action="{{ url_for('check_url') }}" method="get">
-  <input type="text" name="url" placeholder="Enter URL"
-         style="width: min(600px, 90%)"
-         required autocorrect="off" autocapitalize="none" spellcheck="false">
-
-  <details style="margin-top:10px;">
-    <summary>Advanced options</summary>
-    <div style="margin:8px 0 0 12px;">
-     <label for="ua">User-Agent:</label>
-     <select name="ua" id="ua">
-      <option value="chrome_win" selected>Windows 10/11 : Chrome 128</option>
-      <option value="chrome_mac">macOS : Chrome 128</option>
-      <option value="edge_win">Windows 10/11 : Edge 128</option>
-      <option value="firefox_win">Windows 10/11 : Firefox 130</option>
-      <option value="safari_mac">macOS : Safari 18</option>
-
-      <optgroup label="Mobile">
-        <option value="safari_ios">iPhone (iOS 18) : Safari</option>
-        <option value="chrome_android">Android 14 : Chrome</option>
-        <option value="samsung_internet">Android 14 : Samsung Internet</option>
-      </optgroup>
-
-      <optgroup label="In-App / Link Preview">
-        <option value="facebook_inapp_ios">Facebook In-App (iOS)</option>
-        <option value="instagram_inapp_ios">Instagram In-App (iOS)</option>
-        <option value="tiktok_inapp_android">TikTok In-App (Android)</option>
-        <option value="twitter_iphone">Twitter/X In-App (iPhone)</option>
-        <option value="outlook_win_preview">Outlook Desktop Link Preview</option>
-        <option value="slackbot">Slack Link Expander</option>
-      </optgroup>
-
-      <optgroup label="Crawlers">
-        <option value="googlebot_desktop">Googlebot (Desktop)</option>
-        <option value="googlebot_smartphone">Googlebot (Smartphone)</option>
-        <option value="bingbot">Bingbot</option>
-      </optgroup>
-
-      <optgroup label="Legacy">
-        <option value="ie11_win7">Windows 7 : Internet Explorer 11</option>
-      </optgroup>
-
-      <option value="random">Random (rotate)</option>
-      <option value="custom">Custom…</option>
-    </select>
-      <div style="margin-top:6px;">
-        <input type="text" name="ua_custom" placeholder="Custom User-Agent"
-               style="width: min(600px, 90%)"
-               autocorrect="off" autocapitalize="none" spellcheck="false">
-      </div>
-    </div>
-  </details>
-
-  <div style="margin-top:10px;">
-    <label>
-     <input type="checkbox" name="screenshot" value="1">
-     Take screenshot of final page
-    </label>
-    <br>
-    <label>
-     <input type="checkbox" name="detectdl" value="1">
-     Detect auto-downloads on final page
-    </label>
-  </div>
-  <br>
-  <input type="submit" value="Check URL">
-</form>
-"""
-
-RESULTS_HTML = """
-<!doctype html>
-<title>Results</title>
-<h1>URL Redirect Results</h1>
-<p>Redirect chain for: <code>{{ submitted_url }}</code></p>
-<p><strong>User-Agent used:</strong> <code>{{ ua_label }}</code><br>
-<small style="color:#666;">{{ ua_string }}</small></p>
-
-<ol>
-{% for hop in chain %}
-  <li>
-    {% set scheme = (hop.url.split('://', 1)[0] | lower) if '://' in hop.url else '' %}
-    {% if scheme in ['http', 'https'] %}
-      <a href="{{ hop.url }}" target="_blank" rel="noopener">{{ hop.url }}</a>
-    {% else %}
-      <code>{{ hop.url }}</code>
-    {% endif %}
-    {% if hop.status is not none %} — <strong>{{ hop.status }}</strong>{% endif %}
-    {% if hop.method %} ({{ hop.method }}){% endif %}
-    {% if hop.elapsed_ms is not none %} — {{ hop.elapsed_ms }} ms{% endif %}
-    &nbsp;|&nbsp;
-    <a
-      href="https://www.virustotal.com/gui/search/{{ hop.vt_query }}"
-      target="_blank"
-      rel="noopener"
-    >
-      Check on VirusTotal
-    </a>
-  </li>
-{% endfor %}
-</ol>
-
-{% if screenshot_path %}
-  <h2>Final Page Screenshot</h2>
-  <p
-   style="color:#666;">
-   (If the image is blank, the site may block headless browsers or require interaction.)
-  </p>
-  <img
-   src="{{ screenshot_path }}"
-   alt="Final page screenshot"
-   style="max-width: 100%; height: auto; border:1px solid #ddd;"
-  >
-{% elif tried_screenshot %}
-  <p><em>{{ screenshot_note or "Screenshot was requested but not available." }}</em></p>
-{% endif %}
-
-{% if tried_detectdl %}
-  <h2>Auto-download Detection</h2>
-  {% if download_items and download_items|length > 0 %}
-    <p><strong>Downloads detected:</strong></p>
-    <ul>
-      {% for d in download_items %}
-        <li>
-          <a href="{{ d.url }}" rel="noopener">{{ d.name }}</a>
-          {% if d.size %} — {{ d.size }} bytes{% endif %}
-          {% if d.mime %} — {{ d.mime }}{% endif %}
-          {% if d.sha256 %}<br><small>SHA-256: <code>{{ d.sha256 }}</code></small>{% endif %}
-        </li>
-      {% endfor %}
-    </ul>
-  {% else %}
-    <p><em>{{ download_note or "No downloads detected." }}</em></p>
-  {% endif %}
-{% endif %}
-
-<p><a href="{{ url_for('index') }}">Check another URL</a></p>
-"""
+# ---------- Template filter ----------
+@app.template_filter("domain")
+def domain_filter(url):
+    """Extract the hostname from a URL for use in templates."""
+    try:
+        return urlparse(url).hostname or url
+    except Exception:
+        return url
 
 
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(FORM_HTML)
+    return render_template("index.html")
 
 
 @app.route("/check-url", methods=["GET"])
@@ -739,14 +607,9 @@ def check_url():
     submitted_url = request.args.get("url", "").strip()
     ok, normalized = validate_target_url(submitted_url)
     if not ok:
-        return render_template_string(
-            "<p><strong>Invalid URL:</strong> {{ msg }}</p>"
-            "<p><a href='{{ url_for('index') }}'>Back</a></p>",
-            msg=normalized,
-        )
+        return render_template("error.html", msg=normalized)
     submitted_url = normalized
 
-    # ✅ define these first
     ua_key = request.args.get("ua", DEFAULT_UA_KEY)
     ua_custom = request.args.get("ua_custom", "")
     want_shot = request.args.get("screenshot") == "1"
@@ -755,10 +618,11 @@ def check_url():
     if not submitted_url:
         return redirect(url_for("index"))
 
-    # (optional) URL validation here…
-
     ua_string, ua_label = resolve_user_agent(ua_key, ua_custom)
     chain = get_redirect_chain(submitted_url, user_agent=ua_string)
+
+    # Enrich chain with VirusTotal data (no-op if no API key)
+    enrich_chain(chain)
 
     # Always initialize optionals (avoid UnboundLocalError)
     screenshot_path = None
@@ -790,20 +654,18 @@ def check_url():
             final_url, user_agent=ua_string, ua_key=ua_key, session_tag=session_tag
         )
 
-    # render_template_string(... pass all vars ...)
-
-    return render_template_string(
-        RESULTS_HTML,
+    return render_template(
+        "results.html",
         submitted_url=submitted_url,
         ua_label=ua_label,
         ua_string=ua_string,
         chain=chain,
         screenshot_path=screenshot_path,
         tried_screenshot=tried_screenshot,
-        screenshot_note=screenshot_note,  # now always defined
+        screenshot_note=screenshot_note,
         tried_detectdl=tried_detectdl,
         download_items=download_items,
-        download_note=download_note,  # now always defined
+        download_note=download_note,
     )
 
 
@@ -820,8 +682,15 @@ def serve_download(session, filename):
     return send_file(abs_path, as_attachment=True, download_name=os.path.basename(filename), mimetype=mime or "application/octet-stream")
 
 
-@app.before_first_request
+_cleanup_done = False
+
+
+@app.before_request
 def scheduled_cleanup():
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
     try:
         purge_old_artifacts(app.config.get("ARTIFACT_RETENTION_DAYS", 7))
     except Exception:
