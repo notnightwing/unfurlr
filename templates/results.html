@@ -34,24 +34,7 @@
         {% endif %}
       </div>
 
-      {# VT inline badge #}
-      {% if hop.vt %}
-        {% set vt = hop.vt %}
-        {% if vt.malicious > 0 %}
-          <span class="badge vt-red" title="VirusTotal">VT: {{ vt.malicious }} malicious</span>
-        {% elif vt.suspicious > 0 %}
-          <span class="badge vt-amber" title="VirusTotal">VT: {{ vt.suspicious }} suspicious</span>
-        {% else %}
-          <span class="badge vt-green" title="VirusTotal">VT: clean</span>
-        {% endif %}
-        {% if vt.threat_label %}
-          <span class="badge vt-label">{{ vt.threat_label }}</span>
-        {% endif %}
-      {% endif %}
-
       <div class="hop-links">
-        <a href="https://www.virustotal.com/gui/search/{{ hop.vt_query }}"
-           target="_blank" rel="noopener">VirusTotal</a>
         <a href="https://www.mywot.com/scorecard/{{ hop.url | domain }}"
            target="_blank" rel="noopener">WOT Scorecard</a>
       </div>

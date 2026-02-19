@@ -277,28 +277,6 @@ select {
   color: var(--text-muted);
 }
 
-/* VT badges */
-.vt-green {
-  background: rgba(52, 211, 153, 0.15);
-  color: var(--green);
-}
-
-.vt-amber {
-  background: rgba(251, 191, 36, 0.15);
-  color: var(--amber);
-}
-
-.vt-red {
-  background: rgba(248, 113, 113, 0.15);
-  color: var(--red);
-}
-
-.vt-label {
-  background: rgba(248, 113, 113, 0.1);
-  color: var(--red);
-  font-style: italic;
-}
-
 /* Screenshot */
 .screenshot {
   max-width: 100%;

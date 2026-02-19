@@ -11,13 +11,13 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, url_for, send_file, abort
 import socket
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse
 import re
 import hashlib
 import mimetypes
 
 from security import validate_target_url
-from virustotal import enrich_chain
+
 
 # Optional: Selenium
 try:
@@ -330,8 +330,7 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
     if not start_url.lower().startswith(("http://", "https://")):
         start_url = "http://" + start_url.strip()
 
-    vtq = quote(f"url:{start_url}", safe='')
-    chain = [{"url": start_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": vtq}]
+    chain = [{"url": start_url, "status": None, "method": None, "elapsed_ms": None}]
     current = start_url
 
     # Initial guard
@@ -428,7 +427,7 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
 
             # enforce guards per hop
             if not is_url_allowed(next_url):
-                chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": quote(f"url:{next_url}", safe='')})
+                chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None})
                 break
 
             # prevent loops
@@ -436,7 +435,7 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
                 chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None})
                 break
 
-            chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None, "vt_query": quote(f"url:{next_url}", safe='')})
+            chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None})
             current = next_url
 
     return chain
@@ -586,7 +585,7 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
         return [], f"Download detection failed: {e}"
 
 
-# ---------- Template filter ----------
+# ---------- Template filters ----------
 @app.template_filter("domain")
 def domain_filter(url):
     """Extract the hostname from a URL for use in templates."""
@@ -620,9 +619,6 @@ def check_url():
 
     ua_string, ua_label = resolve_user_agent(ua_key, ua_custom)
     chain = get_redirect_chain(submitted_url, user_agent=ua_string)
-
-    # Enrich chain with VirusTotal data (no-op if no API key)
-    enrich_chain(chain)
 
     # Always initialize optionals (avoid UnboundLocalError)
     screenshot_path = None
