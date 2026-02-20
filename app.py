@@ -7,9 +7,14 @@ from datetime import datetime
 import secrets
 from urllib.parse import urljoin
 
-import requests
+from curl_cffi.requests import Session as CurlSession
+from curl_cffi import CurlOpt
+from curl_cffi.requests.errors import RequestsError as CurlRequestsError
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, url_for, send_file, abort
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect
 import socket
 from urllib.parse import urlparse
 import re
@@ -53,6 +58,14 @@ app.config.update(
     SESSION_COOKIE_SECURE=False if _is_dev else True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+)
+
+csrf = CSRFProtect(app)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
 )
 
 # Data directory for artifacts (outside static to avoid direct serving)
@@ -134,6 +147,30 @@ def is_url_allowed(url: str) -> bool:
         return not any(is_ip_private(ip) for ip in ips)
     except Exception:
         return False
+
+
+def resolve_and_check_url(url):
+    """Resolve hostname and verify all IPs are non-private.
+
+    Returns (True, hostname, ip) on success, (False, None, None) on failure.
+    The returned ip must be pinned during the HTTP request to prevent DNS
+    rebinding (TOCTOU) attacks.
+    """
+    try:
+        p = urlparse(url)
+        if p.scheme.lower() not in {"http", "https"}:
+            return False, None, None
+        hostname = p.hostname
+        if not hostname:
+            return False, None, None
+        ips = resolve_hostname_ips(hostname)
+        if not ips:
+            return False, None, None
+        if any(is_ip_private(ip) for ip in ips):
+            return False, None, None
+        return True, hostname, ips[0]
+    except Exception:
+        return False, None, None
 
 
 # -------- User-Agent presets (2024–2025 realistic) --------
@@ -251,6 +288,32 @@ UA_LABELS = {
 
 DEFAULT_UA_KEY = "chrome_win"
 
+# Map UA preset keys to curl_cffi TLS impersonation profiles.
+# Even when the User-Agent header says "Googlebot", the TLS fingerprint
+# should match a real browser to avoid JA3/JA4 detection.
+_IMPERSONATE_MAP = {
+    "chrome_win": "chrome",
+    "chrome_mac": "chrome",
+    "edge_win": "chrome",
+    "firefox_win": "chrome",
+    "safari_mac": "safari",
+    "safari_ios": "safari_ios",
+    "chrome_android": "chrome",
+    "samsung_internet": "chrome",
+    "facebook_inapp_ios": "safari_ios",
+    "instagram_inapp_ios": "safari_ios",
+    "tiktok_inapp_android": "chrome",
+    "twitter_iphone": "safari_ios",
+    "outlook_win_preview": "chrome",
+    "slackbot": "chrome",
+    "googlebot_desktop": "chrome",
+    "googlebot_smartphone": "chrome",
+    "bingbot": "chrome",
+    "ie11_win7": "chrome",
+    "random": "chrome",
+    "custom": "chrome",
+}
+
 # Which UA keys should use a mobile viewport?
 MOBILE_UA_KEYS = {
     "safari_ios",
@@ -320,12 +383,12 @@ def resolve_user_agent(ua_key: str, ua_custom: str):
 
 
 # ---------- Core: follow redirects safely ----------
-def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
+def get_redirect_chain(start_url, user_agent, ua_key="", max_hops=15, timeout=10):
     """
     Returns a list of hop dicts:
       { 'url': <url>, 'status': <int or None>, 'method': 'HEAD'|'GET'|None, 'elapsed_ms': <float|None> }
     First element is the normalized starting URL.
-    Uses a shared requests.Session across hops for connection reuse.
+    Uses curl_cffi with TLS impersonation to avoid JA3/JA4 fingerprint detection.
     """
     if not start_url.lower().startswith(("http://", "https://")):
         start_url = "http://" + start_url.strip()
@@ -333,12 +396,34 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
     chain = [{"url": start_url, "status": None, "method": None, "elapsed_ms": None}]
     current = start_url
 
-    # Initial guard
-    if not is_url_allowed(current):
+    # Initial guard — resolve DNS and pin to prevent rebinding
+    allowed, hostname, pinned_ip = resolve_and_check_url(current)
+    if not allowed:
         return chain
 
-    with requests.Session() as session:
-        session.headers.update({"User-Agent": user_agent})
+    impersonate = _IMPERSONATE_MAP.get(ua_key, "chrome")
+    proxy_url = os.getenv("PROXY_URL", "").strip()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    # Split timeout: fast connect, full read
+    connect_timeout = min(timeout, 5)
+
+    def _resolve_entries(cur_hostname, cur_url):
+        """Build libcurl RESOLVE entries to pin DNS for a given hop."""
+        port = urlparse(cur_url).port
+        return [
+            f"+{cur_hostname}:{port or 443}:{pinned_ip}",
+            f"+{cur_hostname}:{port or 80}:{pinned_ip}",
+        ]
+
+    def _hop_headers(referer):
+        hdrs = {"User-Agent": user_agent}
+        if referer:
+            hdrs["Referer"] = referer
+        return hdrs
+
+    with CurlSession(impersonate=impersonate, proxies=proxies) as session:
+        cur_hostname = hostname
 
         for _ in range(max_hops):
             resp = None
@@ -346,37 +431,43 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
             method_used = None
             elapsed_ms = None
 
+            copts = {CurlOpt.RESOLVE: _resolve_entries(cur_hostname, current)}
+
+            # Determine referer from chain
+            referer = None
+            if chain:
+                ref = chain[-1]["url"]
+                if ref != current:
+                    referer = ref
+
             # Try HEAD first
             try:
                 t0 = time.monotonic()
-                # Set Referer to previous hop when available
-                head_headers = {}
-                if len(chain) > 0:
-                    ref = chain[-1]["url"]
-                    if ref != current:
-                        head_headers["Referer"] = ref
                 resp = session.head(
-                    current, allow_redirects=False, timeout=timeout, headers=head_headers or None
+                    current,
+                    allow_redirects=False,
+                    timeout=(connect_timeout, timeout),
+                    headers=_hop_headers(referer),
+                    curl_options=copts,
                 )
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
                 status = resp.status_code
                 method_used = "HEAD"
-            except requests.RequestException:
+            except CurlRequestsError:
                 # Fallback to GET if HEAD fails/is blocked
                 try:
                     t0 = time.monotonic()
-                    get_headers = {}
-                    if len(chain) > 0:
-                        ref = chain[-1]["url"]
-                        if ref != current:
-                            get_headers["Referer"] = ref
                     resp = session.get(
-                        current, allow_redirects=False, timeout=timeout, headers=get_headers or None
+                        current,
+                        allow_redirects=False,
+                        timeout=(connect_timeout, timeout),
+                        headers=_hop_headers(referer),
+                        curl_options=copts,
                     )
                     elapsed_ms = (time.monotonic() - t0) * 1000.0
                     status = resp.status_code
                     method_used = "GET"
-                except requests.RequestException:
+                except CurlRequestsError:
                     chain[-1]["status"] = None
                     chain[-1]["method"] = None
                     chain[-1]["elapsed_ms"] = None
@@ -393,8 +484,13 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
                     # If we only performed HEAD, do a lightweight GET to scan for meta refresh.
                     if method_used == "HEAD":
                         t0 = time.monotonic()
-                        scan_headers = {"Referer": chain[-1]["url"]} if len(chain) > 0 else None
-                        scan_resp = session.get(current, allow_redirects=False, timeout=min(timeout, 5), headers=scan_headers)
+                        scan_resp = session.get(
+                            current,
+                            allow_redirects=False,
+                            timeout=(connect_timeout, min(timeout, 5)),
+                            headers=_hop_headers(chain[-1]["url"] if chain else None),
+                            curl_options=copts,
+                        )
                         elapsed_ms = (time.monotonic() - t0) * 1000.0
                         status = scan_resp.status_code
                         method_used = "GET"
@@ -414,7 +510,7 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
                         if m:
                             loc = m.group(2).strip()
                             next_url = urljoin(current, loc)
-                except requests.RequestException:
+                except CurlRequestsError:
                     pass
 
                 if not next_url:
@@ -425,10 +521,14 @@ def get_redirect_chain(start_url, user_agent, max_hops=15, timeout=10):
                     break
                 next_url = urljoin(current, loc)
 
-            # enforce guards per hop
-            if not is_url_allowed(next_url):
+            # Resolve and verify next hop, pin DNS to prevent rebinding
+            allowed, next_hostname, next_ip = resolve_and_check_url(next_url)
+            if not allowed:
                 chain.append({"url": next_url, "status": None, "method": None, "elapsed_ms": None})
                 break
+            # Update pinned IP for the next hop
+            pinned_ip = next_ip
+            cur_hostname = next_hostname
 
             # prevent loops
             if any(h["url"] == next_url for h in chain):
@@ -601,24 +701,25 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/check-url", methods=["GET"])
+@app.route("/check-url", methods=["POST"])
+@limiter.limit(os.getenv("RATE_LIMIT", "30/minute"))
 def check_url():
-    submitted_url = request.args.get("url", "").strip()
+    submitted_url = request.form.get("url", "").strip()
     ok, normalized = validate_target_url(submitted_url)
     if not ok:
         return render_template("error.html", msg=normalized)
     submitted_url = normalized
 
-    ua_key = request.args.get("ua", DEFAULT_UA_KEY)
-    ua_custom = request.args.get("ua_custom", "")
-    want_shot = request.args.get("screenshot") == "1"
-    want_detect = request.args.get("detectdl") == "1"
+    ua_key = request.form.get("ua", DEFAULT_UA_KEY)
+    ua_custom = request.form.get("ua_custom", "")
+    want_shot = request.form.get("screenshot") == "1"
+    want_detect = request.form.get("detectdl") == "1"
 
     if not submitted_url:
         return redirect(url_for("index"))
 
     ua_string, ua_label = resolve_user_agent(ua_key, ua_custom)
-    chain = get_redirect_chain(submitted_url, user_agent=ua_string)
+    chain = get_redirect_chain(submitted_url, user_agent=ua_string, ua_key=ua_key)
 
     # Always initialize optionals (avoid UnboundLocalError)
     screenshot_path = None

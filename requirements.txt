@@ -13,9 +13,14 @@ urllib3==2.5.0
 certifi==2025.8.3
 charset-normalizer==3.1.0
 idna==3.4
+curl_cffi>=0.7.0
 
 # Environment
 python-dotenv>=1.0.0
+
+# Security
+Flask-Limiter>=3.5.0
+Flask-WTF>=1.2.0
 
 # Browser automation (optional — screenshot & download detection)
 selenium==4.35.0
