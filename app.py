@@ -3,7 +3,6 @@ import ipaddress
 import os
 import random
 import time
-from datetime import datetime
 import secrets
 from urllib.parse import urljoin
 
@@ -71,10 +70,18 @@ limiter = Limiter(
 # Data directory for artifacts (outside static to avoid direct serving)
 DATA_DIR = os.path.join(app.root_path, "data")
 DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")
+SCREENSHOTS_DIR = os.path.join(DATA_DIR, "screenshots")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 # Retention for artifacts (days)
 app.config["ARTIFACT_RETENTION_DAYS"] = int(os.getenv("ARTIFACT_RETENTION_DAYS", "7"))
+app.config["FEATURE_SCREENSHOT"] = os.getenv(
+    "FEATURE_SCREENSHOT", "true"
+).strip().lower() in ("true", "1", "yes")
+app.config["FEATURE_DETECT_DOWNLOADS"] = os.getenv(
+    "FEATURE_DETECT_DOWNLOADS", "false"
+).strip().lower() in ("true", "1", "yes")
 
 
 @app.after_request
@@ -544,51 +551,48 @@ def get_redirect_chain(start_url, user_agent, ua_key="", max_hops=15, timeout=10
 # ---------- Optional: capture screenshot of final URL ----------
 
 
-def capture_screenshot(
-    final_url, user_agent, ua_key, outfile_rel="static/screens/final_screenshot.png"
-):
+def capture_screenshot(final_url, user_agent, ua_key, screenshot_id):
     """
-    Captures a screenshot of final_url into ./static/screens/ and
-    returns a web path like '/static/screens/<file>.png'.
+    Captures a screenshot of final_url into data/screenshots/ and
+    returns the screenshot_id on success, None on failure.
     Honors mobile UA by enabling Chrome mobile emulation.
-    If Selenium isn’t available or fails, returns None.
+    Pins DNS to prevent TOCTOU/rebinding attacks.
     """
     if not SELENIUM_AVAILABLE:
         return None
 
-    if not is_url_allowed(final_url):
+    allowed, hostname, pinned_ip = resolve_and_check_url(final_url)
+    if not allowed:
         return None
 
-    out_path = os.path.join(app.root_path, outfile_rel)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_path = os.path.join(SCREENSHOTS_DIR, f"{screenshot_id}.png")
 
     try:
         options = Options()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
-
-        # Desktop default window; overridden by mobile emulation below
         options.add_argument("--window-size=1920,1080")
+        options.add_argument(f"--host-resolver-rules=MAP {hostname} {pinned_ip}")
 
         if is_mobile_ua_key(ua_key):
-            # Use Chrome's mobile emulation so layout + DPR look authentic
             options.add_experimental_option(
                 "mobileEmulation", mobile_emulation_payload(user_agent, ua_key)
             )
-        else:
-            # Desktop: just set UA header
-            options.add_argument(f"--user-agent={user_agent}")
 
         driver = webdriver.Chrome(options=options)
         try:
+            if not is_mobile_ua_key(ua_key):
+                driver.execute_cdp_cmd(
+                    "Network.setUserAgentOverride", {"userAgent": user_agent}
+                )
             driver.get(final_url)
-            time.sleep(1.0)  # small settle time
+            time.sleep(1.0)
             driver.save_screenshot(out_path)
         finally:
             driver.quit()
 
-        return "/" + outfile_rel.replace("\\", "/")
+        return screenshot_id
     except Exception:
         return None
 
@@ -601,14 +605,15 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
     Visits final_url in headless Chrome with a dedicated download dir.
     Returns (detected_files_webpaths, note).
     Uses mobile emulation when a mobile UA was chosen.
+    Pins DNS to prevent TOCTOU/rebinding attacks.
     """
     if not SELENIUM_AVAILABLE:
         return [], "Selenium/ChromeDriver not available; skipped download detection."
 
-    if not is_url_allowed(final_url):
+    allowed, hostname, pinned_ip = resolve_and_check_url(final_url)
+    if not allowed:
         return [], "Final URL blocked by policy."
 
-    dl_rel_dir = f"downloads/{session_tag}"
     dl_abs_dir = os.path.join(DOWNLOADS_DIR, session_tag)
     os.makedirs(dl_abs_dir, exist_ok=True)
 
@@ -617,16 +622,13 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
-        options.add_argument(
-            "--window-size=1280,800"
-        )  # desktop default; ignored by mobile emu
+        options.add_argument("--window-size=1280,800")
+        options.add_argument(f"--host-resolver-rules=MAP {hostname} {pinned_ip}")
 
         if is_mobile_ua_key(ua_key):
             options.add_experimental_option(
                 "mobileEmulation", mobile_emulation_payload(user_agent, ua_key)
             )
-        else:
-            options.add_argument(f"--user-agent={user_agent}")
 
         prefs = {
             "download.default_directory": dl_abs_dir,
@@ -638,6 +640,10 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
 
         driver = webdriver.Chrome(options=options)
         try:
+            if not is_mobile_ua_key(ua_key):
+                driver.execute_cdp_cmd(
+                    "Network.setUserAgentOverride", {"userAgent": user_agent}
+                )
             before = set(os.listdir(dl_abs_dir))
             driver.get(final_url)
 
@@ -681,8 +687,8 @@ def detect_auto_downloads(final_url, user_agent, ua_key, session_tag):
             return [], "No downloads detected in the wait window."
         finally:
             driver.quit()
-    except Exception as e:
-        return [], f"Download detection failed: {e}"
+    except Exception:
+        return [], "Download detection failed."
 
 
 # ---------- Template filters ----------
@@ -698,7 +704,11 @@ def domain_filter(url):
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        feature_screenshot=app.config["FEATURE_SCREENSHOT"],
+        feature_detect_downloads=app.config["FEATURE_DETECT_DOWNLOADS"],
+    )
 
 
 @app.route("/check-url", methods=["POST"])
@@ -712,8 +722,8 @@ def check_url():
 
     ua_key = request.form.get("ua", DEFAULT_UA_KEY)
     ua_custom = request.form.get("ua_custom", "")
-    want_shot = request.form.get("screenshot") == "1"
-    want_detect = request.form.get("detectdl") == "1"
+    want_shot = request.form.get("screenshot") == "1" and app.config["FEATURE_SCREENSHOT"]
+    want_detect = request.form.get("detectdl") == "1" and app.config["FEATURE_DETECT_DOWNLOADS"]
 
     if not submitted_url:
         return redirect(url_for("index"))
@@ -734,10 +744,13 @@ def check_url():
     if want_shot and chain:
         tried_screenshot = True
         final_url = chain[-1]["url"]
-        screenshot_path = capture_screenshot(
-            final_url, user_agent=ua_string, ua_key=ua_key
+        screenshot_id = secrets.token_urlsafe(16)
+        result = capture_screenshot(
+            final_url, user_agent=ua_string, ua_key=ua_key, screenshot_id=screenshot_id
         )
-        if not screenshot_path:
+        if result:
+            screenshot_path = url_for("serve_screenshot", screenshot_id=result)
+        else:
             screenshot_note = (
                 "Selenium/ChromeDriver not available or the screenshot failed."
             )
@@ -746,7 +759,7 @@ def check_url():
     if want_detect and chain:
         tried_detectdl = True
         final_url = chain[-1]["url"]
-        session_tag = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        session_tag = secrets.token_urlsafe(16)
         download_items, download_note = detect_auto_downloads(
             final_url, user_agent=ua_string, ua_key=ua_key, session_tag=session_tag
         )
@@ -764,6 +777,19 @@ def check_url():
         download_items=download_items,
         download_note=download_note,
     )
+
+
+@app.route("/screenshots/<screenshot_id>")
+def serve_screenshot(screenshot_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", screenshot_id):
+        abort(404)
+    base = os.path.realpath(SCREENSHOTS_DIR)
+    abs_path = os.path.realpath(os.path.join(base, f"{screenshot_id}.png"))
+    if not abs_path.startswith(os.path.join(base, "")):
+        abort(404)
+    if not os.path.isfile(abs_path):
+        abort(404)
+    return send_file(abs_path, mimetype="image/png")
 
 
 @app.route("/downloads/<session>/<path:filename>")
@@ -797,22 +823,22 @@ def scheduled_cleanup():
 def purge_old_artifacts(max_age_days: int = 7):
     now = time.time()
     cutoff = now - max_age_days * 86400
-    # downloads
-    for root, dirs, files in os.walk(DOWNLOADS_DIR, topdown=False):
-        for name in files:
-            p = os.path.join(root, name)
-            try:
-                if os.path.getmtime(p) < cutoff:
-                    os.remove(p)
-            except Exception:
-                pass
-        for d in dirs:
-            full = os.path.join(root, d)
-            try:
-                if not os.listdir(full):
-                    os.rmdir(full)
-            except Exception:
-                pass
+    for artifacts_dir in (DOWNLOADS_DIR, SCREENSHOTS_DIR):
+        for root, dirs, files in os.walk(artifacts_dir, topdown=False):
+            for name in files:
+                p = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                except Exception:
+                    pass
+            for d in dirs:
+                full = os.path.join(root, d)
+                try:
+                    if not os.listdir(full):
+                        os.rmdir(full)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

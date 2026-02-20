@@ -4,7 +4,8 @@
 {% block content %}
 <div class="card">
   <h1>Check a URL</h1>
-  <form action="{{ url_for('check_url') }}" method="get">
+  <form action="{{ url_for('check_url') }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="text" name="url" placeholder="Enter URL to analyze"
            class="url-input"
            required autocorrect="off" autocapitalize="none" spellcheck="false">
@@ -56,8 +57,12 @@
     </details>
 
     <div class="options-row">
+      {% if feature_screenshot %}
       <label><input type="checkbox" name="screenshot" value="1"> Take screenshot of final page</label>
+      {% endif %}
+      {% if feature_detect_downloads %}
       <label><input type="checkbox" name="detectdl" value="1"> Detect auto-downloads on final page</label>
+      {% endif %}
     </div>
 
     <button type="submit" class="btn">Analyze URL</button>
